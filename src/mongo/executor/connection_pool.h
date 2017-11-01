@@ -44,6 +44,7 @@ class BSONObjBuilder;
 
 namespace executor {
 
+class ConnectionPoolCore;
 struct ConnectionPoolStats;
 
 /**
@@ -135,6 +136,8 @@ public:
 
 private:
     void returnConnection(ConnectionInterface* connection);
+
+    const std::unique_ptr<ConnectionPoolCore> _core;
 
     std::string _name;
 

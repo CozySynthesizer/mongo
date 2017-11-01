@@ -953,6 +953,7 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappens) {
 
     // Verify that a new connection was spawned
     ConnectionImpl::pushSetup(Status::OK());
+    std::cerr << "-------------------------------------- A" << std::endl;
     pool.get(HostAndPort(),
              Milliseconds(5000),
              [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
@@ -960,6 +961,7 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappens) {
                  reachedB = true;
                  doneWith(swConn.getValue());
              });
+    std::cerr << "-------------------------------------- B" << std::endl;
 
     ASSERT(reachedB);
 }
