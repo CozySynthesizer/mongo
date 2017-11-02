@@ -176,20 +176,31 @@ private:
      * At any point a new request sets the state back to running and
      * restarts all timers.
      */
-    enum class State {
-        // The pool is active
-        kRunning,
-
-        // No current activity, waiting for hostTimeout to pass
-        kIdle,
-
-        // hostTimeout is passed, we're waiting for any processing
-        // connections to finish before shutting down
-        kInShutdown,
-    };
-
+    using State = ConnectionPoolCore::HostState;
     State _state;
 };
+
+std::ostream& operator<<(std::ostream& stream, ConnectionPoolCore::HostState state) {
+    switch (state) {
+        case ConnectionPoolCore::HOST_RUNNING:
+            stream << "RUNNING";
+            break;
+        case ConnectionPoolCore::HOST_IDLE:
+            stream << "IDLE";
+            break;
+        case ConnectionPoolCore::HOST_IN_SHUTDOWN:
+            stream << "IN_SHUTDOWN";
+            break;
+        default:
+            stream << "UNKNOWN_STATE";
+            break;
+    }
+    return stream;
+}
+
+static constexpr auto kRunning = ConnectionPoolCore::HOST_RUNNING;
+static constexpr auto kIdle = ConnectionPoolCore::HOST_IDLE;
+static constexpr auto kInShutdown = ConnectionPoolCore::HOST_IN_SHUTDOWN;
 
 constexpr Milliseconds ConnectionPool::kDefaultHostTimeout;
 size_t const ConnectionPool::kDefaultMaxConns = std::numeric_limits<size_t>::max();
@@ -205,7 +216,6 @@ ConnectionPool::ConnectionPool(std::unique_ptr<DependentTypeFactoryInterface> im
                                std::string name,
                                Options options)
     : _core(new ConnectionPoolCore()), _name(std::move(name)), _options(std::move(options)), _factory(std::move(impl)) {
-    _core->markActivity(Date_t::now());
 }
 
 ConnectionPool::~ConnectionPool() = default;
@@ -289,7 +299,7 @@ ConnectionPool::SpecificPool::SpecificPool(ConnectionPool* parent, const HostAnd
       _inFulfillRequests(false),
       _inSpawnConnections(false),
       _created(0),
-      _state(State::kRunning) {}
+      _state(kRunning) {}
 
 ConnectionPool::SpecificPool::~SpecificPool() {
     DESTRUCTOR_GUARD(_requestTimer->cancelTimeout();)
@@ -412,7 +422,7 @@ void ConnectionPool::SpecificPool::returnConnection(ConnectionInterface* connPtr
                              }
 
                              // If we're in shutdown, we don't need refreshed connections
-                             if (_state == State::kInShutdown) {
+                             if (_state == kInShutdown) {
                                  disposeConnection(_parent->_core.get(), handle);
                                  return;
                              }
@@ -473,7 +483,7 @@ void ConnectionPool::SpecificPool::addToReady(stdx::unique_lock<stdx::mutex>& lk
         }
 
         // If we're in shutdown, we don't need to refresh connections
-        if (_state == State::kInShutdown) {
+        if (_state == kInShutdown) {
             disposeConnection(_parent->_core.get(), handle);
             return;
         }
@@ -663,6 +673,7 @@ void ConnectionPool::SpecificPool::spawnConnections(stdx::unique_lock<stdx::mute
 // Called every second after hostTimeout until all processing connections reap
 void ConnectionPool::SpecificPool::shutdown() {
     stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
+    // mycheck_eq(_state, _parent->_core->hostState(_hostAndPort), "enter shutdown");
 
     // We're racing:
     //
@@ -679,13 +690,13 @@ void ConnectionPool::SpecificPool::shutdown() {
     //
     // So we end up in shutdown, but with kRunning.  If we're here we raced and
     // we should just bail.
-    if (_state == State::kRunning) {
+    if (_state == kRunning) {
         cerr << "ABORTING SHUTDOWN (still running)" << endl;
         return;
     }
 
     cerr << "SHUTTING DOWN" << endl;
-    _state = State::kInShutdown;
+    _state = kInShutdown;
 
     // If we have processing connections, wait for them to finish or timeout
     // before shutdown
@@ -705,16 +716,20 @@ void ConnectionPool::SpecificPool::shutdown() {
 
 // Updates our state and manages the request timer
 void ConnectionPool::SpecificPool::updateStateInLock() {
+    // mycheck_eq(_state, _parent->_core->hostState(_hostAndPort), "enter updateStateInLock");
+    // atBlockExit([&]() {
+    //     mycheck_eq(_state, _parent->_core->hostState(_hostAndPort), "exit updateStateInLock");
+    // });
     if (_requests.size()) {
         // We have some outstanding requests, we're live
 
         // If we were already running and the timer is the same as it was
         // before, nothing to do
-        if (_state == State::kRunning && _requestTimerExpiration == _requests.top().first)
+        if (_state == kRunning && _requestTimerExpiration == _requests.top().first)
             return;
 
         cerr << "UPDATE STATE: kRunning (requests)" << endl;
-        _state = State::kRunning;
+        _state = kRunning;
 
         _requestTimer->cancelTimeout();
 
@@ -753,17 +768,17 @@ void ConnectionPool::SpecificPool::updateStateInLock() {
 
         _requestTimer->cancelTimeout();
         cerr << "UPDATE STATE: kRunning (checkedout)" << endl;
-        _state = State::kRunning;
+        _state = kRunning;
         _requestTimerExpiration = _requestTimerExpiration.max();
     } else {
         // If we don't have any live requests and no one has checked out connections
 
         // If we used to be idle, just bail
-        if (_state == State::kIdle)
+        if (_state == kIdle)
             return;
 
         cerr << "UPDATE STATE: kIdle (eh)" << endl;
-        _state = State::kIdle;
+        _state = kIdle;
 
         _requestTimer->cancelTimeout();
 
