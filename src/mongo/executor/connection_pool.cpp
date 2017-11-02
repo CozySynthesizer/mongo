@@ -64,7 +64,7 @@ namespace executor {
 
 static void disposeConnection(ConnectionPoolCore* core, ConnectionPoolCore::Connection* conn) {
     core->rmConn(conn);
-    // delete conn->val.conn_iface;
+    delete conn->val.conn_iface;
     delete conn;
 }
 
@@ -130,7 +130,7 @@ public:
     size_t openConnections(const stdx::unique_lock<stdx::mutex>& lk);
 
 private:
-    using OwnedConnection = std::unique_ptr<ConnectionInterface>;
+    using OwnedConnection = ConnectionInterface*; // std::unique_ptr<ConnectionInterface>;
     using OwnershipPool = stdx::unordered_map<ConnectionInterface*, OwnedConnection>;
     using LRUOwnershipPool = LRUCache<OwnershipPool::key_type, OwnershipPool::mapped_type>;
     using Request = std::pair<Date_t, GetConnectionCallback>;
@@ -476,7 +476,7 @@ void ConnectionPool::SpecificPool::returnConnection(ConnectionInterface* connPtr
 // Adds a live connection to the ready pool
 void ConnectionPool::SpecificPool::addToReady(stdx::unique_lock<stdx::mutex>& lk,
                                               OwnedConnection conn) {
-    auto connPtr = conn.get();
+    auto connPtr = conn;
     auto handle = _parent->_core->handleForInterface(connPtr);
 
     // This makes the connection the new most-recently-used connection.
@@ -584,7 +584,7 @@ void ConnectionPool::SpecificPool::fulfillRequests(stdx::unique_lock<stdx::mutex
 
         auto handle = _parent->_core->mruConn(_hostAndPort);
         if (!handle) break;
-        auto connPtr = _readyPool.begin()->second.release();
+        auto connPtr = _readyPool.begin()->second;
         _readyPool.erase(_readyPool.begin());
         mycheck_eq(handle->val.conn_iface, connPtr, "fulfillRequests 3");
 
@@ -654,13 +654,13 @@ void ConnectionPool::SpecificPool::spawnConnections(stdx::unique_lock<stdx::mute
         OwnedConnection handle;
         try {
             // make a new connection and put it in processing
-            handle = _parent->_factory->makeConnection(_hostAndPort, _generation);
+            handle = _parent->_factory->makeConnection(_hostAndPort, _generation).release();
         } catch (std::system_error& e) {
             severe() << "Failed to construct a new connection object: " << e.what();
             fassertFailed(40336);
         }
 
-        auto connPtr = handle.get();
+        auto connPtr = handle;
         _processingPool[connPtr] = std::move(handle);
 
         auto c = new ConnectionPoolCore::Connection();
