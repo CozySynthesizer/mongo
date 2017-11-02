@@ -133,12 +133,6 @@ private:
     using OwnedConnection = ConnectionInterface*; // std::unique_ptr<ConnectionInterface>;
     using OwnershipPool = stdx::unordered_map<ConnectionInterface*, OwnedConnection>;
     using LRUOwnershipPool = LRUCache<OwnershipPool::key_type, OwnershipPool::mapped_type>;
-    using Request = std::pair<Date_t, GetConnectionCallback>;
-    struct RequestComparator {
-        bool operator()(const Request& a, const Request& b) {
-            return a.first > b.first;
-        }
-    };
 
     void addToReady(stdx::unique_lock<stdx::mutex>& lk, OwnedConnection conn);
 
@@ -154,8 +148,6 @@ private:
     ConnectionPool* const _parent;
 
     const HostAndPort _hostAndPort;
-
-    std::priority_queue<Request, std::vector<Request>, RequestComparator> _requests;
 
     std::unique_ptr<TimerInterface> _requestTimer;
     Date_t _requestTimerExpiration;
@@ -337,13 +329,14 @@ void ConnectionPool::SpecificPool::getConnection(const HostAndPort& hostAndPort,
 
     const auto expiration = _parent->_factory->now() + timeout;
 
-    _requests.push(make_pair(expiration, std::move(cb)));
-
     auto r = new ConnectionPoolCore::Request();
     r->val.rq_expiration = expiration;
     r->val.rq_host = hostAndPort;
-    r->val.rq_callback = [](StatusWith<ConnectionHandle>) { };
+    r->val.rq_callback = std::move(cb);
     _parent->_core->addReq(r);
+    _parent->_core->reqsForHost(_hostAndPort, [](ConnectionPoolCore::Request* r) {
+        cerr << " - have req " << r << " for " << r->val.rq_host << endl;
+    });
 
     updateStateInLock();
 
@@ -518,13 +511,9 @@ void ConnectionPool::SpecificPool::processFailure(const Status& status,
     // TODO: also delete them!
     _parent->_core->dropAllReadyOrProcessingConnections(_hostAndPort);
 
-    // Move the requests out so they aren't visible
-    // in other threads
-    decltype(_requests) requestsToFail;
-    {
-        using std::swap;
-        swap(requestsToFail, _requests);
-    }
+    std::vector<ConnectionPoolCore::Request*> toDel;
+    _parent->_core->reqsForHost(_hostAndPort, [&](ConnectionPoolCore::Request* r) { toDel.push_back(r); });
+    _parent->_core->clearReqs(_hostAndPort);
 
     // Update state to reflect the lack of requests
     updateStateInLock();
@@ -533,9 +522,9 @@ void ConnectionPool::SpecificPool::processFailure(const Status& status,
     // with the same failed status
     lk.unlock();
 
-    while (requestsToFail.size()) {
-        requestsToFail.top().second(status);
-        requestsToFail.pop();
+    for (auto* r : toDel) {
+        r->val.rq_callback(status);
+        delete r;
     }
 }
 
@@ -550,7 +539,8 @@ void ConnectionPool::SpecificPool::fulfillRequests(stdx::unique_lock<stdx::mutex
     auto guard = MakeGuard([&] { _inFulfillRequests = false; });
     mycheck_eq(_parent->_core->openConnections(_hostAndPort), openConnections(lk), "fulfillRequests");
 
-    while (_requests.size()) {
+    while (_parent->_core->hasReq(_hostAndPort)) {
+        auto req = _parent->_core->nextReq(_hostAndPort);
         auto handle = _parent->_core->mruConn(_hostAndPort);
         if (!handle) break;
         auto connPtr = handle->val.conn_iface;
@@ -574,8 +564,9 @@ void ConnectionPool::SpecificPool::fulfillRequests(stdx::unique_lock<stdx::mutex
         }
 
         // Grab the request and callback
-        auto cb = std::move(_requests.top().second);
-        _requests.pop();
+        auto cb = std::move(req->val.rq_callback);
+        _parent->_core->popReq(_hostAndPort);
+        delete req;
 
         // check out the connection
         _parent->_core->changeState(handle, ConnectionPoolCore::CHECKED_OUT);
@@ -607,7 +598,7 @@ void ConnectionPool::SpecificPool::spawnConnections(stdx::unique_lock<stdx::mute
         return std::max(
             _parent->_options.minConnections,
             std::min(
-                _requests.size() + _parent->_core->inUseConnections(_hostAndPort),
+                (size_t)(_parent->_core->numReqs(_hostAndPort) + _parent->_core->inUseConnections(_hostAndPort)),
                 _parent->_options.maxConnections));
     };
 
@@ -713,7 +704,7 @@ void ConnectionPool::SpecificPool::shutdown() {
         return;
     }
 
-    invariant(_requests.empty());
+    invariant(!_parent->_core->hasReq(_hostAndPort));
 
     _parent->_core->shutdown(_hostAndPort);
     _parent->_pools.erase(_hostAndPort);
@@ -726,12 +717,13 @@ void ConnectionPool::SpecificPool::updateStateInLock() {
     // atBlockExit([&]() {
     //     mycheck_eq(_state, _parent->_core->hostState(_hostAndPort), "exit updateStateInLock");
     // });
-    if (_requests.size()) {
+    if (_parent->_core->hasReq(_hostAndPort)) {
         // We have some outstanding requests, we're live
 
         // If we were already running and the timer is the same as it was
         // before, nothing to do
-        if (_state == kRunning && _requestTimerExpiration == _requests.top().first)
+        auto nextReqExpiration = _parent->_core->nextReq(_hostAndPort)->val.rq_expiration;
+        if (_state == kRunning && _requestTimerExpiration == nextReqExpiration)
             return;
 
         cerr << "UPDATE STATE: kRunning (requests)" << endl;
@@ -739,9 +731,9 @@ void ConnectionPool::SpecificPool::updateStateInLock() {
 
         _requestTimer->cancelTimeout();
 
-        _requestTimerExpiration = _requests.top().first;
+        _requestTimerExpiration = nextReqExpiration;
 
-        auto timeout = _requests.top().first - _parent->_factory->now();
+        auto timeout = nextReqExpiration - _parent->_factory->now();
 
         // We set a timer for the most recent request, then invoke each timed
         // out request we couldn't service
@@ -750,12 +742,13 @@ void ConnectionPool::SpecificPool::updateStateInLock() {
 
             auto now = _parent->_factory->now();
 
-            while (_requests.size()) {
-                auto& x = _requests.top();
+            while (_parent->_core->hasReq(_hostAndPort)) {
+                auto* x = _parent->_core->nextReq(_hostAndPort);
 
-                if (x.first <= now) {
-                    auto cb = std::move(x.second);
-                    _requests.pop();
+                if (x->val.rq_expiration <= now) {
+                    auto cb = std::move(x->val.rq_callback);
+                    _parent->_core->popReq(_hostAndPort);
+                    delete x;
 
                     lk.unlock();
                     cb(Status(ErrorCodes::NetworkInterfaceExceededTimeLimit,
