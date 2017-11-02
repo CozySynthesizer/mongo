@@ -339,6 +339,12 @@ void ConnectionPool::SpecificPool::getConnection(const HostAndPort& hostAndPort,
 
     _requests.push(make_pair(expiration, std::move(cb)));
 
+    auto r = new ConnectionPoolCore::Request();
+    r->val.rq_expiration = expiration;
+    r->val.rq_host = hostAndPort;
+    r->val.rq_callback = [](StatusWith<ConnectionHandle>) { };
+    _parent->_core->addReq(r);
+
     updateStateInLock();
 
     spawnConnections(lk);
