@@ -58,7 +58,23 @@ struct ConnectionPoolStats;
  */
 class ConnectionPool {
     class ConnectionHandleDeleter;
-    class SpecificPool;
+    // class SpecificPool;
+
+    void fulfillReqs(
+        stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort);
+
+    void waitForNextEvent(
+        const stdx::unique_lock<stdx::mutex>& lk);
+
+    void spawnConnections(
+        stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort);
+
+    void spawnConnection(
+        stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort,
+        size_t generation = 0 /* TODO */);
 
 public:
     class ConnectionInterface;
@@ -138,6 +154,7 @@ private:
     void returnConnection(ConnectionInterface* connection);
 
     const std::unique_ptr<ConnectionPoolCore> _core;
+    std::unique_ptr<TimerInterface> _requestTimer;
 
     std::string _name;
 
@@ -149,7 +166,7 @@ private:
 
     // The global mutex for specific pool access and the generation counter
     mutable stdx::mutex _mutex;
-    stdx::unordered_map<HostAndPort, std::unique_ptr<SpecificPool>> _pools;
+    // stdx::unordered_map<HostAndPort, std::unique_ptr<SpecificPool>> _pools;
 };
 
 class ConnectionPool::ConnectionHandleDeleter {
