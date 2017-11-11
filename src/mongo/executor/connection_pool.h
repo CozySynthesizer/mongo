@@ -80,6 +80,10 @@ class ConnectionPool {
         void* c, /* cannot forward-declare inner Connection class */
         Status status);
 
+    void cleanupHost(
+        const stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort);
+
 public:
     class ConnectionInterface;
     class DependentTypeFactoryInterface;

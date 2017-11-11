@@ -64,6 +64,7 @@ namespace mongo {
 namespace executor {
 
 static void disposeConnection(ConnectionPoolCore* core, ConnectionPoolCore::Connection* conn) {
+    cerr << "!!! DISPOSING OF " << conn << " !!!" << endl;
     core->rmConn(conn);
     delete conn->val.conn_iface;
     delete conn;
@@ -236,19 +237,20 @@ ConnectionPool::ConnectionPool(std::unique_ptr<DependentTypeFactoryInterface> im
         options.refreshTimeout,
         options.refreshRequirement,
         options.hostTimeout,
-        {}, {}, {})),
+        {}, {})),
     _requestTimer(impl->makeTimer()),
     _name(std::move(name)),
     _options(std::move(options)),
     _factory(std::move(impl)) {
 }
 
-ConnectionPool::~ConnectionPool() = default;
+ConnectionPool::~ConnectionPool() {
+    cerr << "DELETED CONNECTION POOL" << endl;
+}
 
-void ConnectionPool::dropConnections(const HostAndPort& hostAndPort) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-
-    cerr << "dropConnections(" << hostAndPort << ')' << endl;
+void ConnectionPool::cleanupHost(
+        const stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort) {
 
     // Drop (or mark as dropped) connections to the host.
     std::vector<ConnectionPoolCore::Connection*> toMark;
@@ -291,6 +293,13 @@ void ConnectionPool::dropConnections(const HostAndPort& hostAndPort) {
     // iter->second.get()->processFailure(
     //     Status(ErrorCodes::PooledConnectionsDropped, "Pooled connections dropped"), std::move(lk));
 
+}
+
+void ConnectionPool::dropConnections(const HostAndPort& hostAndPort) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+    cerr << "dropConnections(" << hostAndPort << ')' << endl;
+    cleanupHost(lk, hostAndPort);
     cerr << "dropConnections finished" << endl;
 }
 
@@ -325,7 +334,7 @@ void ConnectionPool::processingComplete(void* cc, Status status) {
     if (status.isOK()) {
         cerr << "  SUCCESS: " << c << endl;
         auto now = _factory->now();
-        _core->changeState(c, ConnectionPoolCore::READY, now, _core->getRefreshRequirement());
+        _core->changeState(c, ConnectionPoolCore::READY, now, now, _core->getRefreshRequirement());
         cerr << "    (refresh in " << (c->val.conn_next_refresh - now) << "; req=" << _core->getRefreshRequirement() << ")" << endl;
         fulfillReqs(lk, hostAndPort);
         spawnConnections(lk, hostAndPort);
@@ -389,6 +398,8 @@ void ConnectionPool::spawnConnections(
     cerr << "now in spawnConnections" << endl;
     cerr << "  conns: " << _core->openConnections(hostAndPort) << '/' << _core->maxConnsPerHost() << endl;
     cerr << "  refrs: " << _core->refreshingConnections(hostAndPort) << '/' << _core->maxRefreshingConnsPerHost() << endl;
+    cerr << "  avail+refrshing = " << _core->availableConnections(hostAndPort) << '+' << _core->refreshingConnections(hostAndPort) << endl;
+    cerr << "  #reqs: " << _core->numReqs(hostAndPort) << endl;
     cerr << "  min=" << _core->minConnsPerHost() << endl;
     while (_core->needsMoreConnections(hostAndPort)) {
         cerr << "spawning conn to " << hostAndPort << endl;
@@ -406,13 +417,14 @@ void ConnectionPool::fulfillReqs(
         if (!r) break;
         auto c = _core->mruConn(hostAndPort);
         if (!c) break;
-        cerr << "fulfilling " << r << endl;
+        cerr << "fulfilling " << r << " w/" << c << " (total reqs: " << _core->numReqs(r->val.rq_host) << ')' << endl;
         _core->requestGranted(r, c);
         lk.unlock();
         r->val.rq_callback(ConnectionPool::ConnectionHandle(
             c->val.conn_iface,
             ConnectionPool::ConnectionHandleDeleter(this)));
         lk.lock();
+        cerr << "  (now total reqs: " << _core->numReqs(r->val.rq_host) << ')' << endl;
         delete r;
     }
 }
@@ -430,11 +442,23 @@ void ConnectionPool::waitForNextEvent(
     auto time = _core->nextEvent();
     cerr << "next event @" << time << endl;
     auto now = _factory->now();
-    cerr << "waiting " << (time-now) << " for next event" << endl;
+    cerr << "waiting " << (time-now) << " for next event..." << endl;
     _requestTimer->setTimeout(time - now, [this] {
         cerr << "EVENT!" << endl;
         stdx::unique_lock<stdx::mutex> lk(_mutex);
         auto now = _factory->now();
+
+        // check for expired hosts
+        std::vector<HostAndPort> expiredHosts;
+        _core->expiredHosts(now, [&expiredHosts](const HostAndPort& p) {
+            expiredHosts.push_back(p);
+        });
+        for (auto& p : expiredHosts) {
+            cerr << "HOST EXPIRED: " << p << endl;
+            cleanupHost(lk, p);
+        }
+
+        // check for expired requests
         std::vector<ConnectionPoolCore::Request*> expired;
         _core->expiredRequests(now, [&expired](ConnectionPoolCore::Request* r) {
             cerr << "  request expired: " << r << endl;
@@ -447,23 +471,30 @@ void ConnectionPool::waitForNextEvent(
             _core->dropRequest(r);
             delete r;
         }
+
+        // check for connections needing refresh
         std::vector<ConnectionPoolCore::Connection*> toRefresh;
         _core->connectionsToRefresh(now, [&toRefresh](ConnectionPoolCore::Connection* c) {
             cerr << "  conn " << c << " needs refresh!" << endl;
             toRefresh.push_back(c);
         });
         for (auto c : toRefresh) {
-            _core->changeState(c, ConnectionPoolCore::PROCESSING, now, _core->getRefreshRequirement());
-            lk.unlock();
-            c->val.conn_iface->refresh(_core->getRefreshTimeout(), [this, c](ConnectionInterface* connPtr, Status status) {
-                processingComplete(c, status);
-            });
-            lk.lock();
+            if (_core->shouldKeepConnection(c)) {
+                _core->changeState(c, ConnectionPoolCore::PROCESSING, now, now, _core->getRefreshRequirement());
+                lk.unlock();
+                c->val.conn_iface->refresh(_core->getRefreshTimeout(), [this, c](ConnectionInterface* connPtr, Status status) {
+                    processingComplete(c, status);
+                });
+                lk.lock();
+            } else {
+                disposeConnection(_core.get(), c);
+            }
         }
         // fulfillReqs(lk, hostAndPort);
         // TODO: process ready conns
         waitForNextEvent(lk);
     });
+    cerr << "  timeout set!" << endl;
 }
 
 void ConnectionPool::get(const HostAndPort& hostAndPort,
@@ -537,29 +568,46 @@ size_t ConnectionPool::getNumConnectionsPerHost(const HostAndPort& hostAndPort) 
 
 void ConnectionPool::returnConnection(ConnectionInterface* conn) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    cerr << "conn returned: " << conn << endl;
-    invariant(conn->getStatus() != kConnectionStateUnknown);
     auto c = _core->handleForInterface(conn);
+    cerr << "conn returned: " << c << " (state==" << c->val.conn_state << ')' << endl;
+    invariant(conn->getStatus() != kConnectionStateUnknown);
 
     // Was this connection marked dropped while it was checked out?
     if (c->val.conn_dropped) {
-        cerr << "  was dropped!" << endl;
+        cerr << (c->val.conn_dropped ? "  was dropped!" : "  not needed!") << endl;
         disposeConnection(_core.get(), c);
         return;
     }
 
-    _core->changeState(c, ConnectionPoolCore::READY, _factory->now(), _core->getRefreshRequirement());
+    _core->changeState(c, ConnectionPoolCore::READY, _factory->now(), conn->getLastUsed(), _core->getRefreshRequirement());
+    auto hostAndPort = c->val.conn_host;
+
+    // if (_core->hasExcessConnections(hostAndPort)) {
+    //     // drop it!
+    //     cerr << "  dropping due to excess" << endl;
+    //     disposeConnection(_core.get(), c);
+    //     return;
+    // }
 
     if (!conn->getStatus().isOK()) {
-        const auto& host = c->val.conn_host;
         // TODO: alert via some callback if the host is bad
-        log() << "Ending connection to host " << host << " due to bad connection status; "
-              << _core->openConnections(host) << " connections to that host remain open";
+        log() << "Ending connection to host " << hostAndPort << " due to bad connection status; "
+              << _core->openConnections(hostAndPort) << " connections to that host remain open";
         disposeConnection(_core.get(), c);
         return;
     }
 
-    fulfillReqs(lk, c->val.conn_host);
+    // // Drop LRU connections
+    // cerr << "checking for unnecessary connections..." << endl;
+    // while (_core->hasExcessConnections(hostAndPort)) {
+    //     auto lru = _core->lruOwnedConn(hostAndPort);
+    //     cerr << "  dropping unnecessary conn " << lru << endl;
+    //     cerr << "    state = " << lru->val.conn_state << endl;
+    //     invariant(lru);
+    //     disposeConnection(_core.get(), lru);
+    // }
+
+    fulfillReqs(lk, hostAndPort);
     waitForNextEvent(lk);
 
     // auto iter = _pools.find(conn->getHostAndPort());
