@@ -74,7 +74,11 @@ class ConnectionPool {
     void spawnConnection(
         stdx::unique_lock<stdx::mutex>& lk,
         const HostAndPort& hostAndPort,
-        size_t generation = 0 /* TODO */);
+        size_t generation = 0 /* TODO? */);
+
+    void processingComplete(
+        void* c, /* cannot forward-declare inner Connection class */
+        Status status);
 
 public:
     class ConnectionInterface;
@@ -86,9 +90,9 @@ public:
     using GetConnectionCallback = stdx::function<void(StatusWith<ConnectionHandle>)>;
 
     static constexpr Milliseconds kDefaultHostTimeout = Milliseconds(300000);  // 5mins
-    static const size_t kDefaultMaxConns;
-    static const size_t kDefaultMinConns;
-    static const size_t kDefaultMaxConnecting;
+    static const int kDefaultMaxConns;
+    static const int kDefaultMinConns;
+    static const int kDefaultMaxConnecting;
     static constexpr Milliseconds kDefaultRefreshRequirement = Milliseconds(60000);  // 1min
     static constexpr Milliseconds kDefaultRefreshTimeout = Milliseconds(20000);      // 20secs
 
@@ -101,21 +105,21 @@ public:
          * The minimum number of connections to keep alive while the pool is in
          * operation
          */
-        size_t minConnections = kDefaultMinConns;
+        int minConnections = kDefaultMinConns;
 
         /**
          * The maximum number of connections to spawn for a host. This includes
          * pending connections in setup and connections checked out of the pool
          * as well as the obvious live connections in the pool.
          */
-        size_t maxConnections = kDefaultMaxConns;
+        int maxConnections = kDefaultMaxConns;
 
         /**
          * The maximum number of processing connections for a host.  This includes pending
          * connections in setup/refresh. It's designed to rate limit connection storms rather than
          * steady state processing (as maxConnections does).
          */
-        size_t maxConnecting = kDefaultMaxConnecting;
+        int maxConnecting = kDefaultMaxConnecting;
 
         /**
          * Amount of time to wait before timing out a refresh attempt

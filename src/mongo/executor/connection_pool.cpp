@@ -48,10 +48,10 @@ using std::cout;
 using std::cerr;
 using std::endl;
 
-#define mycheck(cond, dbg) \
-    if (!(cond)) { std::cerr << dbg << std::endl; invariant(false); }
-#define mycheck_eq(x, y, dbg) \
-    mycheck((x) == (y), '@' << (dbg) << " ... " << (#x) << " != " << (#y) << ": " << (x) << " vs " << (y))
+// #define mycheck(cond, dbg) \
+//     if (!(cond)) { std::cerr << dbg << std::endl; invariant(false); }
+// #define mycheck_eq(x, y, dbg) \
+//     mycheck((x) == (y), '@' << (dbg) << " ... " << (#x) << " != " << (#y) << ": " << (x) << " vs " << (y))
 
 // One interesting implementation note herein concerns how setup() and
 // refresh() are invoked outside of the global lock, but setTimeout is not.
@@ -217,9 +217,9 @@ static constexpr auto kIdle = ConnectionPoolCore::HOST_IDLE;
 static constexpr auto kInShutdown = ConnectionPoolCore::HOST_IN_SHUTDOWN;
 
 constexpr Milliseconds ConnectionPool::kDefaultHostTimeout;
-size_t const ConnectionPool::kDefaultMaxConns = std::numeric_limits<size_t>::max();
-size_t const ConnectionPool::kDefaultMinConns = 1;
-size_t const ConnectionPool::kDefaultMaxConnecting = std::numeric_limits<size_t>::max();
+int const ConnectionPool::kDefaultMaxConns = std::numeric_limits<int>::max();
+int const ConnectionPool::kDefaultMinConns = 1;
+int const ConnectionPool::kDefaultMaxConnecting = std::numeric_limits<int>::max();
 constexpr Milliseconds ConnectionPool::kDefaultRefreshRequirement;
 constexpr Milliseconds ConnectionPool::kDefaultRefreshTimeout;
 
@@ -250,23 +250,27 @@ void ConnectionPool::dropConnections(const HostAndPort& hostAndPort) {
 
     cerr << "dropConnections(" << hostAndPort << ')' << endl;
 
-    // Design issue: processing connections cannot cancel their setup() or
-    // refresh() requests.  Therefore we need to mark them as "dropped" and
-    // wait for them to come back to us.  See calls to setup() and refresh().
-    // TODO
-
-    // TODO: what to do about checked-out conns?
-
-    // Drop all ready connections.
-    std::vector<ConnectionPoolCore::Connection*> ready;
-    _core->enumerateReadyConns(hostAndPort, [&ready](ConnectionPoolCore::Connection* c) { ready.push_back(c); });
-    for (auto c : ready) {
-        cerr << "  cleaning up ready connection " << c << endl;
-        _core->rmConn(c);
-        delete c;
+    // Drop (or mark as dropped) connections to the host.
+    std::vector<ConnectionPoolCore::Connection*> toMark;
+    std::vector<ConnectionPoolCore::Connection*> toDel;
+    _core->connsForHost(hostAndPort, [&toDel, &toMark](ConnectionPoolCore::Connection* c) {
+        // Connections currently owned by the pool (i.e. those in the READY or
+        // PROCESSING states) can be deleted immediately.  Connections that are
+        // checked out by clients need to be marked "dropped" and they will be
+        // cleaned up when they are returned to us.
+        (c->val.conn_state == ConnectionPoolCore::CHECKED_OUT ?
+            toMark : toDel).push_back(c);
+    });
+    for (auto c : toDel) {
+        cerr << "  cleaning up connection " << c << endl;
+        disposeConnection(_core.get(), c);
+    }
+    for (auto c : toMark) {
+        cerr << "  marking dropped: " << c << endl;
+        _core->markDropped(c);
     }
 
-    // Drop all requests.
+    // Drop all requests for the host.
     std::vector<ConnectionPoolCore::Request*> reqs;
     _core->reqsForHost(hostAndPort, [&reqs](ConnectionPoolCore::Request* r) { reqs.push_back(r); });
     Status statusToReport(
@@ -292,6 +296,63 @@ void ConnectionPool::dropConnections(const HostAndPort& hostAndPort) {
 
 using Factory = ConnectionPool::DependentTypeFactoryInterface;
 
+void ConnectionPool::processingComplete(void* cc, Status status) {
+    ConnectionPoolCore::Connection* c = reinterpret_cast<ConnectionPoolCore::Connection*>(cc);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    cerr << "Setup/refresh finished for " << c << " in state " << c->val.conn_state << endl;
+    const auto& hostAndPort = c->val.conn_host;
+    auto* connPtr = c->val.conn_iface;
+    connPtr->indicateUsed();
+    connPtr->cancelTimeout(); // defensive, and it makes the test fixture happy
+
+    // stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
+
+    // // If the host and port were dropped, let this lapse
+    // if (conn->getGeneration() != _generation) {
+    //     disposeConnection(_parent->_core.get(), handle);
+    //     spawnConnections(lk);
+    //     return;
+    // }
+
+    // // If we're in shutdown, we don't need refreshed connections
+    // if (_state == kInShutdown) {
+    //     disposeConnection(_parent->_core.get(), handle);
+    //     return;
+    // }
+
+    // If the connection refreshed successfully, throw it back in the ready
+    // pool
+    if (status.isOK()) {
+        cerr << "  SUCCESS: " << c << endl;
+        auto now = _factory->now();
+        _core->changeState(c, ConnectionPoolCore::READY, now, _core->getRefreshRequirement());
+        cerr << "    (refresh in " << (c->val.conn_next_refresh - now) << "; req=" << _core->getRefreshRequirement() << ")" << endl;
+        fulfillReqs(lk, hostAndPort);
+        spawnConnections(lk, hostAndPort);
+        waitForNextEvent(lk);
+        return;
+    }
+
+    // If we've exceeded the time limit, start a new connect, rather than
+    // failing all operations.  We do this because the various callers have
+    // their own time limit which is unrelated to our internal one.
+    if (status.code() == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
+        cerr << "  Oops! FAILED: " << c << endl;
+        log() << "Pending connection to host " << hostAndPort
+              << " did not complete within the connection timeout,"
+              << " retrying with a new connection;" << _core->openConnections(hostAndPort)
+              << " connections to that host remain open";
+        disposeConnection(_core.get(), c);
+        spawnConnections(lk, hostAndPort);
+        waitForNextEvent(lk);
+        return;
+    }
+    cerr << "Unimplemented setup case; " << c << endl;
+
+    // // Otherwise pass the failure on through
+    // processFailure(status, std::move(lk));
+}
+
 void ConnectionPool::spawnConnection(
         stdx::unique_lock<stdx::mutex>& lk,
         const HostAndPort& hostAndPort,
@@ -315,56 +376,8 @@ void ConnectionPool::spawnConnection(
     cerr << "Setting up connection " << c << " (initial state: " << c->val.conn_state << ')' << endl;
     lk.unlock();
     connPtr->setup(_core->getRefreshTimeout(),
-        [this, c, hostAndPort](ConnectionInterface* connPtr, Status status) {
-            stdx::unique_lock<stdx::mutex> lk(_mutex);
-            cerr << "Setup finished for " << c << " in state " << c->val.conn_state << endl;
-            connPtr->indicateUsed();
-            connPtr->cancelTimeout(); // defensive, and it makes the test fixture happy
-
-            // stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
-
-            // // If the host and port were dropped, let this lapse
-            // if (conn->getGeneration() != _generation) {
-            //     disposeConnection(_parent->_core.get(), handle);
-            //     spawnConnections(lk);
-            //     return;
-            // }
-
-            // // If we're in shutdown, we don't need refreshed connections
-            // if (_state == kInShutdown) {
-            //     disposeConnection(_parent->_core.get(), handle);
-            //     return;
-            // }
-
-            // If the connection refreshed successfully, throw it back in the ready
-            // pool
-            if (status.isOK()) {
-                cerr << "  SUCCESS: " << c << endl;
-                _core->changeState(c, ConnectionPoolCore::READY, _factory->now(), _core->getRefreshTimeout());
-                fulfillReqs(lk, hostAndPort);
-                spawnConnections(lk, hostAndPort);
-                waitForNextEvent(lk);
-                return;
-            }
-
-            // If we've exceeded the time limit, start a new connect, rather than
-            // failing all operations.  We do this because the various callers have
-            // their own time limit which is unrelated to our internal one.
-            if (status.code() == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
-                cerr << "  Oops! FAILED: " << c << endl;
-                log() << "Pending connection to host " << hostAndPort
-                      << " did not complete within the connection timeout,"
-                      << " retrying with a new connection;" << _core->openConnections(hostAndPort)
-                      << " connections to that host remain open";
-                disposeConnection(_core.get(), c);
-                spawnConnections(lk, hostAndPort);
-                waitForNextEvent(lk);
-                return;
-            }
-            cerr << "Unimplemented setup case; " << c << endl;
-
-            // // Otherwise pass the failure on through
-            // processFailure(status, std::move(lk));
+        [this, c](ConnectionInterface* connPtr, Status status) {
+            processingComplete(c, status);
     });
     lk.lock();
 }
@@ -373,13 +386,14 @@ void ConnectionPool::spawnConnection(
 void ConnectionPool::spawnConnections(
         stdx::unique_lock<stdx::mutex>& lk,
         const HostAndPort& hostAndPort) {
-    // needs conn:
-    //   - (#conns < min) OR
-    //   - (#conns < max AND (#avail + #proc) < #req)
+    cerr << "now in spawnConnections" << endl;
+    cerr << "  conns: " << _core->openConnections(hostAndPort) << '/' << _core->maxConnsPerHost() << endl;
+    cerr << "  refrs: " << _core->refreshingConnections(hostAndPort) << '/' << _core->maxRefreshingConnsPerHost() << endl;
+    cerr << "  min=" << _core->minConnsPerHost() << endl;
     while (_core->needsMoreConnections(hostAndPort)) {
         cerr << "spawning conn to " << hostAndPort << endl;
         spawnConnection(lk, hostAndPort);
-        cerr << "   ... now have " << _core->openConnections(hostAndPort) << endl;
+        cerr << "   ... now have " << _core->openConnections(hostAndPort) << '/' << _core->maxConnsPerHost() << endl;
     }
 }
 
@@ -432,6 +446,19 @@ void ConnectionPool::waitForNextEvent(
         for (auto r : expired) {
             _core->dropRequest(r);
             delete r;
+        }
+        std::vector<ConnectionPoolCore::Connection*> toRefresh;
+        _core->connectionsToRefresh(now, [&toRefresh](ConnectionPoolCore::Connection* c) {
+            cerr << "  conn " << c << " needs refresh!" << endl;
+            toRefresh.push_back(c);
+        });
+        for (auto c : toRefresh) {
+            _core->changeState(c, ConnectionPoolCore::PROCESSING, now, _core->getRefreshRequirement());
+            lk.unlock();
+            c->val.conn_iface->refresh(_core->getRefreshTimeout(), [this, c](ConnectionInterface* connPtr, Status status) {
+                processingComplete(c, status);
+            });
+            lk.lock();
         }
         // fulfillReqs(lk, hostAndPort);
         // TODO: process ready conns
@@ -512,11 +539,16 @@ void ConnectionPool::returnConnection(ConnectionInterface* conn) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     cerr << "conn returned: " << conn << endl;
     invariant(conn->getStatus() != kConnectionStateUnknown);
-
     auto c = _core->handleForInterface(conn);
-    _core->changeState(c, ConnectionPoolCore::READY, _factory->now(), _core->getRefreshTimeout());
 
-    // TODO: generation!
+    // Was this connection marked dropped while it was checked out?
+    if (c->val.conn_dropped) {
+        cerr << "  was dropped!" << endl;
+        disposeConnection(_core.get(), c);
+        return;
+    }
+
+    _core->changeState(c, ConnectionPoolCore::READY, _factory->now(), _core->getRefreshRequirement());
 
     if (!conn->getStatus().isOK()) {
         const auto& host = c->val.conn_host;
