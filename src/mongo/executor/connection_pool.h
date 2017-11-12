@@ -28,13 +28,11 @@
 #pragma once
 
 #include <memory>
-#include <queue>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -58,31 +56,6 @@ struct ConnectionPoolStats;
  */
 class ConnectionPool {
     class ConnectionHandleDeleter;
-    // class SpecificPool;
-
-    void fulfillReqs(
-        stdx::unique_lock<stdx::mutex>& lk,
-        const HostAndPort& hostAndPort);
-
-    void waitForNextEvent(
-        const stdx::unique_lock<stdx::mutex>& lk);
-
-    void spawnConnections(
-        stdx::unique_lock<stdx::mutex>& lk,
-        const HostAndPort& hostAndPort);
-
-    void spawnConnection(
-        stdx::unique_lock<stdx::mutex>& lk,
-        const HostAndPort& hostAndPort,
-        size_t generation = 0 /* TODO? */);
-
-    void processingComplete(
-        void* c, /* cannot forward-declare inner Connection class */
-        Status status);
-
-    void cleanupHost(
-        const stdx::unique_lock<stdx::mutex>& lk,
-        const HostAndPort& hostAndPort);
 
 public:
     class ConnectionInterface;
@@ -161,20 +134,34 @@ public:
 private:
     void returnConnection(ConnectionInterface* connection);
 
+    void fulfillReqs(
+        stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort);
+
+    void waitForNextEvent(
+        const stdx::unique_lock<stdx::mutex>& lk);
+
+    void spawnConnections(
+        stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort);
+
+    void processingComplete(
+        void* c, /* cannot forward-declare inner Connection class */
+        Status status);
+
+    void cleanupHost(
+        const stdx::unique_lock<stdx::mutex>& lk,
+        const HostAndPort& hostAndPort);
+
     const std::unique_ptr<ConnectionPoolCore> _core;
     std::unique_ptr<TimerInterface> _requestTimer;
 
     std::string _name;
 
-    // Options are set at startup and never changed at run time, so these are
-    // accessed outside the lock
-    const Options _options;
-
     const std::unique_ptr<DependentTypeFactoryInterface> _factory;
 
     // The global mutex for specific pool access and the generation counter
     mutable stdx::mutex _mutex;
-    // stdx::unordered_map<HostAndPort, std::unique_ptr<SpecificPool>> _pools;
 };
 
 class ConnectionPool::ConnectionHandleDeleter {
