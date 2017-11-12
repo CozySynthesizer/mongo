@@ -475,11 +475,14 @@ void ConnectionPool::waitForNextEvent(
         // check for connections needing refresh
         std::vector<ConnectionPoolCore::Connection*> toRefresh;
         _core->connectionsToRefresh(now, [&toRefresh](ConnectionPoolCore::Connection* c) {
-            cerr << "  conn " << c << " needs refresh!" << endl;
             toRefresh.push_back(c);
         });
         for (auto c : toRefresh) {
-            if (_core->shouldKeepConnection(c)) {
+            if (_core->shouldKeepConnection(c, now)) {
+                cerr << "  conn " << c << " needs refresh!" << endl;
+                cerr << "    now it is  " << now << endl;
+                cerr << "    returned @ " << c->val.conn_returned << endl;
+                cerr << "    timeout  @ " << (c->val.conn_returned + _core->getRefreshRequirement()) << endl;
                 _core->changeState(c, ConnectionPoolCore::PROCESSING, now, now, _core->getRefreshRequirement());
                 lk.unlock();
                 c->val.conn_iface->refresh(_core->getRefreshTimeout(), [this, c](ConnectionInterface* connPtr, Status status) {
@@ -487,6 +490,7 @@ void ConnectionPool::waitForNextEvent(
                 });
                 lk.lock();
             } else {
+                cerr << "  conn " << c << " is no longer needed" << endl;
                 disposeConnection(_core.get(), c);
             }
         }
