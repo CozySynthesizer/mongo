@@ -1,0 +1,278 @@
+{{
+#include "mongo/stdx/chrono.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+#include "mongo/executor/connection_pool.h"
+
+namespace mongo {
+namespace executor {
+}}
+
+ConnectionPoolCore:
+    type HostAndPort = Native "HostAndPort"
+    type Timestamp = Native "Date_t"
+    type Timespan  = Native "Milliseconds"
+    type Callback = Native "ConnectionPool::GetConnectionCallback"
+    type ConnState = enum { READY, PROCESSING, CHECKED_OUT }
+    type ConnInterface = Native "ConnectionPool::ConnectionInterface*"
+    type HostState = enum { HOST_RUNNING, HOST_IDLE, HOST_IN_SHUTDOWN }
+
+    handletype Connection = {
+        conn_state        : ConnState,
+        conn_host         : HostAndPort,
+        conn_iface        : ConnInterface,
+        conn_next_refresh : Timestamp,
+        conn_returned     : Timestamp,
+        conn_dropped      : Bool
+    }
+
+    handletype Request = {
+        rq_expiration : Timestamp,
+        rq_host       : HostAndPort,
+        rq_callback   : Callback
+    }
+
+    extern todo() : Timestamp = "Date_t()"
+    extern eternity() : Timestamp = "Date_t::max()"
+    extern after(t : Timestamp, span : Timespan) : Timestamp = "{t} + {span}"
+
+    // options (immutable)
+    state minConnections     : Int
+    state maxConnections     : Int
+    state maxConnecting      : Int
+    state refreshTimeout     : Timespan
+    state refreshRequirement : Timespan
+    state hostTimeout        : Timespan
+
+    // state
+//    state shutdownReqs   : Set<HostAndPort>
+    state conns          : List<Connection>
+    state reqs           : Set<Request>
+
+    invariant unique conns;
+    invariant unique [ c.val.conn_iface | c <- conns ];
+
+    // ------------------------------------------------------------ STATS
+
+    query allHosts()
+        distinct [ c.val.conn_host | c <- conns ]
+
+    query connsForHost(p : HostAndPort)
+        [ c | c <- conns, c.val.conn_host == p ]
+
+    query enumerateReadyConns(p : HostAndPort)
+        [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == READY ]
+
+    query inUseConnections(p : HostAndPort)
+        len [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == CHECKED_OUT ]
+
+    query availableConnections(p : HostAndPort)
+        len enumerateReadyConns(p)
+
+    query refreshingConnections(p : HostAndPort)
+        len [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == PROCESSING ]
+
+    query openConnections(p : HostAndPort)
+        inUseConnections(p) + availableConnections(p) + refreshingConnections(p)
+
+    query reqsForHost(p : HostAndPort)
+        [ r | r <- reqs, r.val.rq_host == p ]
+
+    query numReqs(p : HostAndPort)
+        len reqsForHost(p)
+
+    // ------------------------------------------------------------ CORE
+
+    query maxConnsPerHost()
+        maxConnections
+    query maxRefreshingConnsPerHost()
+        maxConnecting
+    query minConnsPerHost()
+        minConnections
+    query getRefreshRequirement()
+        refreshRequirement
+    query getRefreshTimeout()
+        refreshTimeout
+
+    query needsMoreConnections(p : HostAndPort)
+        // Our goal is to keep the following constraints satisfied (more
+        // important ones first):
+        //   - #refreshing <= maxConnecting AND
+        //   - #conns <= max AND
+        //   - #conns >= min AND
+        //   - (#avail + #proc) = #req
+        // Thus, we need more connections if the first two would remain
+        // satisfied after adding a connection (i.e. < instead of <=) and
+        // either #conns falls short of min or we don't have enough connections
+        // to satisfy the requests.
+        (refreshingConnections(p) < maxConnecting) and
+        (openConnections(p) < maxConnections) and
+        (openConnections(p) < minConnections or
+            availableConnections(p) + refreshingConnections(p) < numReqs(p))
+
+    query hasExcessConnections(p : HostAndPort)
+        (openConnections(p) > minConnections) and
+        (availableConnections(p) + refreshingConnections(p) > numReqs(p))
+
+    query shouldKeepConnection(c : Connection, now : Timestamp)
+        // Do we want keep this ready connection around?
+        assume c.val.conn_state == READY;
+        // YES, if it has been used very recently (NOTE: I got this wrong at first)
+            (after(c.val.conn_returned, refreshRequirement) > now) or
+        // YES, if we need to keep minConnections constraint satisfied
+            (openConnections(c.val.conn_host) <= minConnections) or
+        // YES, if we have requests to serve
+            (availableConnections(c.val.conn_host) + refreshingConnections(c.val.conn_host) < numReqs(c.val.conn_host))
+        // and of course, NO otherwise.
+
+    query nextReq(p : HostAndPort)
+        // The next request to expire
+        argmin { req -> req.val.rq_expiration } reqsForHost(p)
+
+    query hasReq(p : HostAndPort)
+        exists reqsForHost(p)
+
+    query mruConn(p : HostAndPort)
+        [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == READY ][0]
+
+    query lruOwnedConn(p : HostAndPort)
+        (reversed [ c | c <- conns, c.val.conn_host == p and (c.val.conn_state == READY or c.val.conn_state == PROCESSING) ])[0]
+
+    private query someConnIsCheckedOut(p : HostAndPort)
+        exists [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == CHECKED_OUT ]
+
+    private query isRunning(p : HostAndPort)
+        hasReq(p) or someConnIsCheckedOut(p)
+
+//    query hostState(p : HostAndPort)
+//        (isRunning(p))            ? HOST_RUNNING :
+//        (not (p in shutdownReqs)) ? HOST_IDLE :
+//                                    HOST_IN_SHUTDOWN
+
+    query handleForInterface(i : ConnInterface)
+        the [ c | c <- conns, c.val.conn_iface == i ]
+
+    query hasEvent()
+        exists reqs or exists [ c | c <- conns, c.val.conn_state == READY ]
+
+    private query lastActivity(p : HostAndPort)
+        // When was the last time a connection got returned?
+        assume not isRunning(p);
+        max [ c.val.conn_returned |
+            c <- conns, c.val.conn_host == p and
+            c.val.conn_state != CHECKED_OUT ]
+
+    private query hostExpiration(p : HostAndPort)
+        // When should we determine that we can close all the open connections
+        // to a given host/port?
+        isRunning(p) ? eternity() : after(lastActivity(p), hostTimeout)
+
+    private query allKnownHosts()
+        [ c.val.conn_host | c <- conns ] + [ r.val.rq_host | r <- reqs ]
+
+    query nextEvent()
+        assume hasEvent();
+        min ([ r.val.rq_expiration     | r <- reqs ] +
+             [ c.val.conn_next_refresh | c <- conns, c.val.conn_state == READY ] +
+             [ hostExpiration(p)       | p <- allKnownHosts() ])
+
+//    query activeHosts()
+//        // All hosts that are currently running
+//        distinct [ p |
+//            p <- allKnownHosts(),
+//            isRunning(p) ]
+//
+//    query idleHosts(cutoff : Timestamp)
+//        distinct [ p |
+//            p <- allKnownHosts(),
+//            not isRunning(p) and
+//            lastActivity(p) < cutoff ]
+
+    query expiredRequests(now : Timestamp)
+        [ r | r <- reqs, r.val.rq_expiration <= now ]
+
+    query connectionsToRefresh(now : Timestamp)
+        [ c | c <- conns,
+            c.val.conn_state == READY and
+            c.val.conn_next_refresh <= now ]
+
+    query expiredHosts(now : Timestamp)
+        [ p | p <- allKnownHosts(),
+            not isRunning(p) and
+            hostExpiration(p) <= now ]
+
+    // ------------------------------------------------------------ UPDATES
+
+    op addReq(r : Request)
+        assume not (r in reqs);
+        reqs.add(r);
+
+//    op popReq(p : HostAndPort)
+//        assume hasReq(p);
+//        reqs.remove(nextReq(p));
+
+    op dropRequest(r : Request)
+        assume r in reqs;
+        reqs.remove(r);
+
+//    op clearReqs(p : HostAndPort)
+//        reqs.remove_all(reqsForHost(p));
+
+    op requestGranted(r : Request, c : Connection)
+        assume r in reqs;
+        assume c in conns;
+        assume c.val.conn_state == READY;
+        reqs.remove(r);
+        c.val.conn_state = CHECKED_OUT;
+
+    op addConn(c : Connection)
+        assume not (c.val.conn_iface in [ cc.val.conn_iface | cc <- conns ]);
+        if not (c in conns) { conns.add_front(c); }
+
+    op changeState(
+            c        : Connection,
+            newstate : ConnState,
+            now      : Timestamp,
+            lastUsed : Timestamp,
+            rt       : Timespan)
+        assume rt == refreshRequirement; // Oops! Cozy bug requires this to be an arg.
+        assume c in conns;
+        c.val.conn_state = newstate;
+        if (newstate == READY) {
+            // this is now the most-recently-used connection
+            conns.remove(c);
+            conns.add_front(c);
+            c.val.conn_next_refresh = after(lastUsed, rt);
+            c.val.conn_returned = now;
+        }
+
+    op markDropped(c : Connection)
+        assume c.val.conn_state == CHECKED_OUT;
+        c.val.conn_dropped = true;
+
+//    op connWasRefreshed(c : Connection, nextRefresh : Timestamp)
+//        c.val.conn_next_refresh = nextRefresh;
+
+    op rmConn(c : Connection)
+        conns.remove(c);
+
+//    op dropAllReadyOrProcessingConnections(p : HostAndPort)
+//        conns.remove_all([ c | c <- conns, c.val.conn_host == p and (
+//            c.val.conn_state == READY or
+//            c.val.conn_state == PROCESSING) ]);
+
+//    op onShutdownTimerFired(p : HostAndPort)
+//        if (not isRunning(p) and not (p in shutdownReqs)) {
+//            shutdownReqs.add(p);
+//        }
+
+//    op shutdown(p : HostAndPort)
+//        conns.remove_all([ c | c <- conns, c.val.conn_host == p ]);
+
+{{
+
+} // end executor namespace
+} // end mongo namespace
+
+}}
