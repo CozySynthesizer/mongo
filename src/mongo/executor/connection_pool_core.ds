@@ -1,4 +1,6 @@
 {{
+#include <memory>
+
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
@@ -13,7 +15,7 @@ ConnectionPoolCore:
     type HostAndPort = Native "HostAndPort"
     type Timestamp = Native "Date_t"
     type Timespan  = Native "Milliseconds"
-    type Callback = Native "ConnectionPool::GetConnectionCallback"
+    type Callback = Native "std::unique_ptr<ConnectionPool::GetConnectionCallback>"
     type ConnState = enum { READY, PROCESSING, CHECKED_OUT }
     type ConnInterface = Native "ConnectionPool::ConnectionInterface*"
 

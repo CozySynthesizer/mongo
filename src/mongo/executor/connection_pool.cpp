@@ -113,7 +113,7 @@ void ConnectionPool::cleanupHost(
         "Pooled connections dropped");
     for (auto r : reqs) {
         _core->rmReq(r);
-        r->val.rq_callback(statusToReport);
+        (*(r->val.rq_callback))(statusToReport);
         delete r;
     }
 }
@@ -199,7 +199,7 @@ void ConnectionPool::fulfillReqs(
         if (!c) break;
         _core->requestGranted(r, c);
         lk.unlock();
-        r->val.rq_callback(ConnectionPool::ConnectionHandle(
+        (*(r->val.rq_callback))(ConnectionPool::ConnectionHandle(
             c->val.conn_iface,
             ConnectionPool::ConnectionHandleDeleter(this)));
         lk.lock();
@@ -232,7 +232,7 @@ void ConnectionPool::waitForNextEvent(
         // check for expired requests
         std::vector<ConnectionPoolCore::Request*> expired;
         _core->expiredRequests(now, [&expired](ConnectionPoolCore::Request* r) {
-            r->val.rq_callback(Status(
+            (*(r->val.rq_callback))(Status(
                 ErrorCodes::NetworkInterfaceExceededTimeLimit,
                 "Couldn't get a connection within the time limit"));
             expired.push_back(r);
@@ -282,7 +282,7 @@ void ConnectionPool::get(const HostAndPort& hostAndPort,
     auto r = new ConnectionPoolCore::Request();
     r->val.rq_expiration = _factory->now() + timeout;
     r->val.rq_host = hostAndPort;
-    r->val.rq_callback = std::move(cb);
+    r->val.rq_callback.reset(new GetConnectionCallback(std::move(cb)));
     _core->addReq(r);
 
     spawnConnections(lk, hostAndPort);
