@@ -153,3 +153,7 @@ CMakeLists.txt
 DriverInclude.wxs
 
 compile_commands.json
+
+# Cozy
+*.checked
+*.synthesized
