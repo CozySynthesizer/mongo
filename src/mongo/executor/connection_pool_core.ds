@@ -25,6 +25,7 @@ ConnectionPoolCore:
         conn_iface        : ConnInterface,
         conn_next_refresh : Timestamp,
         conn_returned     : Timestamp,
+        conn_last_used    : Int,
         conn_dropped      : Bool
     }
 
@@ -46,10 +47,10 @@ ConnectionPoolCore:
     state hostTimeout        : Timespan
 
     // state
-    state conns          : List<Connection>
+    state conns          : Set<Connection>
     state reqs           : Set<Request>
+    state retId          : Int
 
-    invariant unique conns;
     invariant unique [ c.val.conn_iface | c <- conns ];
 
     // ------------------------------------------------------------ STATS
@@ -123,7 +124,10 @@ ConnectionPoolCore:
         exists reqsForHost(p)
 
     query mruConn(p : HostAndPort)
-        [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == READY ][0]
+        argmax { c -> c.val.conn_last_used } [ c |
+            c <- conns,
+            c.val.conn_host == p,
+            c.val.conn_state == READY ]
 
     private query someConnIsCheckedOut(p : HostAndPort)
         exists [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == CHECKED_OUT ]
@@ -181,16 +185,26 @@ ConnectionPoolCore:
         assume r in reqs;
         reqs.remove(r);
 
+    op addConn(c : Connection)
+        assume not (c.val.conn_iface in [ cc.val.conn_iface | cc <- conns ]);
+        assume not (c in conns);
+        conns.add(c);
+
+    op rmConn(c : Connection)
+        assume c in conns;
+        conns.remove(c);
+
+    op markDropped(c : Connection)
+        assume c.val.conn_state == CHECKED_OUT;
+        assume c in conns;
+        c.val.conn_dropped = true;
+
     op requestGranted(r : Request, c : Connection)
         assume r in reqs;
         assume c in conns;
         assume c.val.conn_state == READY;
         reqs.remove(r);
         c.val.conn_state = CHECKED_OUT;
-
-    op addConn(c : Connection)
-        assume not (c.val.conn_iface in [ cc.val.conn_iface | cc <- conns ]);
-        if not (c in conns) { conns.add_front(c); }
 
     op changeState(
             c        : Connection,
@@ -203,18 +217,11 @@ ConnectionPoolCore:
         c.val.conn_state = newstate;
         if (newstate == READY) {
             // this is now the most-recently-used connection
-            conns.remove(c);
-            conns.add_front(c);
             c.val.conn_next_refresh = after(lastUsed, rt);
             c.val.conn_returned = now;
+            c.val.conn_last_used = retId;
+            retId = retId + 1;
         }
-
-    op markDropped(c : Connection)
-        assume c.val.conn_state == CHECKED_OUT;
-        c.val.conn_dropped = true;
-
-    op rmConn(c : Connection)
-        conns.remove(c);
 
 {{
 

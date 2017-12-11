@@ -75,7 +75,8 @@ ConnectionPool::ConnectionPool(std::unique_ptr<DependentTypeFactoryInterface> im
         options.refreshTimeout,
         options.refreshRequirement,
         options.hostTimeout,
-        {}, {})),
+        {}, {},
+        0)),
     _requestTimer(impl->makeTimer()),
     _name(std::move(name)),
     _factory(std::move(impl)) {
