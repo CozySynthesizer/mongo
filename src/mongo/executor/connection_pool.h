@@ -36,13 +36,14 @@
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
+class ConnectionPoolCore;
+
 namespace mongo {
 
 class BSONObjBuilder;
 
 namespace executor {
 
-class ConnectionPoolCore;
 struct ConnectionPoolStats;
 
 /**

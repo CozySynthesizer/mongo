@@ -7,17 +7,25 @@
 #include "mongo/util/time_support.h"
 #include "mongo/executor/connection_pool.h"
 
-namespace mongo {
-namespace executor {
+namespace std {
+  template <> struct hash<mongo::Date_t> {
+    typedef mongo::Date_t argument_type;
+    typedef std::size_t result_type;
+    result_type operator()(argument_type const& x) const noexcept {
+      return static_cast<result_type>(x.toMillisSinceEpoch());
+    }
+  };
+}
+
 }}
 
 ConnectionPoolCore:
-    type HostAndPort = Native "HostAndPort"
-    type Timestamp = Native "Date_t"
-    type Timespan  = Native "Milliseconds"
-    type Callback = Native "std::unique_ptr<ConnectionPool::GetConnectionCallback>"
+    type HostAndPort = Native "mongo::HostAndPort"
+    type Timestamp = Native "mongo::Date_t"
+    type Timespan  = Native "mongo::Milliseconds"
+    type Callback = Native "std::unique_ptr<mongo::executor::ConnectionPool::GetConnectionCallback>"
     type ConnState = enum { READY, PROCESSING, CHECKED_OUT }
-    type ConnInterface = Native "ConnectionPool::ConnectionInterface*"
+    type ConnInterface = Native "mongo::executor::ConnectionPool::ConnectionInterface*"
 
     handletype Connection = {
         conn_state        : ConnState,
@@ -35,7 +43,7 @@ ConnectionPoolCore:
         rq_callback   : Callback
     }
 
-    extern eternity() : Timestamp = "Date_t::max()"
+    extern eternity() : Timestamp = "mongo::Date_t::max()"
     extern after(t : Timestamp, span : Timespan) : Timestamp = "{t} + {span}"
 
     // options (immutable)
@@ -222,10 +230,3 @@ ConnectionPoolCore:
             c.val.conn_last_used = retId;
             retId = retId + 1;
         }
-
-{{
-
-} // end executor namespace
-} // end mongo namespace
-
-}}
