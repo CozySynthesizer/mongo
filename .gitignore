@@ -157,3 +157,4 @@ compile_commands.json
 # Cozy
 *.checked
 *.synthesized
+/src/mongo/executor/connection_pool_core.h
