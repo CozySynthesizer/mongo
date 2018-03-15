@@ -23,7 +23,7 @@ ConnectionPoolCore:
     type HostAndPort = Native "mongo::HostAndPort"
     type Timestamp = Native "mongo::Date_t"
     type Timespan  = Native "mongo::Milliseconds"
-    type Callback = Native "std::unique_ptr<mongo::executor::ConnectionPool::GetConnectionCallback>"
+    type Callback = Native "mongo::executor::ConnectionPool::GetConnectionCallback*"
     type ConnState = enum { READY, PROCESSING, CHECKED_OUT }
     type ConnInterface = Native "mongo::executor::ConnectionPool::ConnectionInterface*"
 

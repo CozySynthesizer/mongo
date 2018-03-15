@@ -55,6 +55,13 @@ static void disposeConnection(ConnectionPoolCore* core, ConnectionPoolCore::Conn
     delete conn;
 }
 
+static void deleteRequest(ConnectionPoolCore::Request* r) {
+    if (r->val.rq_callback) {
+        delete r->val.rq_callback;
+    }
+    delete r;
+}
+
 constexpr Milliseconds ConnectionPool::kDefaultHostTimeout;
 int const ConnectionPool::kDefaultMaxConns = std::numeric_limits<int>::max();
 int const ConnectionPool::kDefaultMinConns = 1;
@@ -115,7 +122,7 @@ void ConnectionPool::cleanupHost(
     for (auto r : reqs) {
         _core->rmReq(r);
         (*(r->val.rq_callback))(statusToReport);
-        delete r;
+        deleteRequest(r);
     }
 }
 
@@ -204,7 +211,7 @@ void ConnectionPool::fulfillReqs(
             c->val.conn_iface,
             ConnectionPool::ConnectionHandleDeleter(this)));
         lk.lock();
-        delete r;
+        deleteRequest(r);
     }
 }
 
@@ -240,7 +247,7 @@ void ConnectionPool::waitForNextEvent(
         });
         for (auto r : expired) {
             _core->rmReq(r);
-            delete r;
+            deleteRequest(r);
         }
 
         // check for connections needing refresh
@@ -283,7 +290,7 @@ void ConnectionPool::get(const HostAndPort& hostAndPort,
     auto r = new ConnectionPoolCore::Request();
     r->val.rq_expiration = _factory->now() + timeout;
     r->val.rq_host = hostAndPort;
-    r->val.rq_callback.reset(new GetConnectionCallback(std::move(cb)));
+    r->val.rq_callback = new GetConnectionCallback(std::move(cb));
     _core->addReq(r);
 
     spawnConnections(lk, hostAndPort);
