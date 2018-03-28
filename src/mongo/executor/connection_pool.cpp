@@ -229,33 +229,23 @@ void ConnectionPool::waitForNextEvent(
         auto now = _factory->now();
 
         // check for expired hosts
-        std::vector<HostAndPort> expiredHosts;
-        _core->expiredHosts(now, [&expiredHosts](const HostAndPort& p) {
-            expiredHosts.push_back(p);
-        });
-        for (auto& p : expiredHosts) {
-            cleanupHost(lk, p);
+        while (_core->hasExpiredHost(now)) {
+            cleanupHost(lk, _core->nextHostToExpire());
         }
 
         // check for expired requests
-        std::vector<ConnectionPoolCore::Request*> expired;
-        _core->expiredRequests(now, [&expired](ConnectionPoolCore::Request* r) {
+        while (_core->hasExpiredRequest(now)) {
+            auto r = _core->nextRequestToExpire();
             (*(r->val.rq_callback))(Status(
                 ErrorCodes::NetworkInterfaceExceededTimeLimit,
                 "Couldn't get a connection within the time limit"));
-            expired.push_back(r);
-        });
-        for (auto r : expired) {
             _core->rmReq(r);
             deleteRequest(r);
         }
 
         // check for connections needing refresh
-        std::vector<ConnectionPoolCore::Connection*> toRefresh;
-        _core->connectionsToRefresh(now, [&toRefresh](ConnectionPoolCore::Connection* c) {
-            toRefresh.push_back(c);
-        });
-        for (auto c : toRefresh) {
+        while (_core->hasConnectionToRefresh(now)) {
+            auto c = _core->nextConnectionToRefresh();
             if (_core->shouldKeepConnection(c, now)) {
                 _core->markProcessing(c);
                 lk.unlock();

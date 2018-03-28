@@ -170,18 +170,29 @@ ConnectionPoolCore:
              [ c.val.conn_next_refresh | c <- conns, c.val.conn_state == READY ] +
              [ hostExpiration(p)       | p <- allKnownHosts() ])
 
-    query expiredRequests(now : Timestamp)
-        [ r | r <- reqs, r.val.rq_expiration <= now ]
+    query nextRequestToExpire()
+        assume exists reqs;
+        argmin { r -> r.val.rq_expiration } reqs
 
-    query connectionsToRefresh(now : Timestamp)
-        [ c | c <- conns,
-            c.val.conn_state == READY and
-            c.val.conn_next_refresh <= now ]
+    query hasExpiredRequest(now : Timestamp)
+        (exists reqs) and (nextRequestToExpire().val.rq_expiration <= now)
 
-    query expiredHosts(now : Timestamp)
-        [ p | p <- allKnownHosts(),
-            not isRunning(p) and
-            hostExpiration(p) <= now ]
+    private query readyConns()
+        [ c | c <- conns, c.val.conn_state == READY ]
+
+    query nextConnectionToRefresh()
+        assume exists conns;
+        argmin { c -> c.val.conn_next_refresh } readyConns()
+
+    query hasConnectionToRefresh(now : Timestamp)
+        (exists readyConns()) and (nextConnectionToRefresh().val.conn_next_refresh <= now)
+
+    query nextHostToExpire()
+        assume exists allKnownHosts();
+        argmin { p -> hostExpiration(p) } allKnownHosts()
+
+    query hasExpiredHost(now : Timestamp)
+        (exists allKnownHosts()) and (hostExpiration(nextHostToExpire()) <= now)
 
     // ------------------------------------------------------------ UPDATES
 
