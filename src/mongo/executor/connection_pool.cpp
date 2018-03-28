@@ -143,7 +143,7 @@ void ConnectionPool::processingComplete(void* cc, Status status) {
     // pool
     if (status.isOK()) {
         auto now = _factory->now();
-        _core->changeState(c, ConnectionPoolCore::READY, now, now, _core->getRefreshRequirement());
+        _core->markReady(c, now, now, _core->getRefreshRequirement());
         fulfillReqs(lk, hostAndPort);
         spawnConnections(lk, hostAndPort);
         waitForNextEvent(lk);
@@ -257,7 +257,7 @@ void ConnectionPool::waitForNextEvent(
         });
         for (auto c : toRefresh) {
             if (_core->shouldKeepConnection(c, now)) {
-                _core->changeState(c, ConnectionPoolCore::PROCESSING, now, now, _core->getRefreshRequirement());
+                _core->markProcessing(c);
                 lk.unlock();
                 c->val.conn_iface->refresh(_core->getRefreshTimeout(), [this, c](ConnectionInterface* connPtr, Status status) {
                     processingComplete(c, status);
@@ -336,7 +336,7 @@ void ConnectionPool::returnConnection(ConnectionInterface* conn) {
         return;
     }
 
-    _core->changeState(c, ConnectionPoolCore::READY, _factory->now(), conn->getLastUsed(), _core->getRefreshRequirement());
+    _core->markReady(c, _factory->now(), conn->getLastUsed(), _core->getRefreshRequirement());
     fulfillReqs(lk, hostAndPort);
     waitForNextEvent(lk);
 }

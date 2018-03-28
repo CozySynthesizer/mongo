@@ -196,6 +196,7 @@ ConnectionPoolCore:
     op addConn(c : Connection)
         assume not (c.val.conn_iface in [ cc.val.conn_iface | cc <- conns ]);
         assume not (c in conns);
+        assume c.val.conn_state == PROCESSING;
         conns.add(c);
 
     op rmConn(c : Connection)
@@ -214,19 +215,22 @@ ConnectionPoolCore:
         reqs.remove(r);
         c.val.conn_state = CHECKED_OUT;
 
-    op changeState(
+    op markProcessing(c : Connection)
+        assume c in conns;
+        assume c.val.conn_state == READY;
+        c.val.conn_state = PROCESSING;
+
+    op markReady(
             c        : Connection,
-            newstate : ConnState,
             now      : Timestamp,
             lastUsed : Timestamp,
             rt       : Timespan)
         assume rt == refreshRequirement; // Oops! Cozy bug requires this to be an arg.
         assume c in conns;
-        c.val.conn_state = newstate;
-        if (newstate == READY) {
-            // this is now the most-recently-used connection
-            c.val.conn_next_refresh = after(lastUsed, rt);
-            c.val.conn_returned = now;
-            c.val.conn_last_used = retId;
-            retId = retId + 1;
-        }
+        assume c.val.conn_state != READY;
+        c.val.conn_state = READY;
+        // this is now the most-recently-used connection
+        c.val.conn_next_refresh = after(lastUsed, rt);
+        c.val.conn_returned = now;
+        c.val.conn_last_used = retId;
+        retId = retId + 1;
