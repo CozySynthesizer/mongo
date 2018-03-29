@@ -60,6 +60,7 @@ ConnectionPoolCore:
     state retId          : Int
 
     invariant unique [ c.val.conn_iface | c <- conns ];
+    invariant all [ c.val.conn_last_used < retId | c <- conns, c.val.conn_state == READY ];
 
     // ------------------------------------------------------------ STATS
 
