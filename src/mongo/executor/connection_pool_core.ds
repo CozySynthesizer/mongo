@@ -27,7 +27,7 @@ ConnectionPoolCore:
     type ConnState = enum { READY, PROCESSING, CHECKED_OUT }
     type ConnInterface = Native "mongo::executor::ConnectionPool::ConnectionInterface*"
 
-    handletype Connection = {
+    type Connection = {
         conn_state        : ConnState,
         conn_host         : HostAndPort,
         conn_iface        : ConnInterface,
@@ -37,14 +37,16 @@ ConnectionPoolCore:
         conn_dropped      : Bool
     }
 
-    handletype Request = {
+    type Request = {
+        rq_callback   : Callback,
         rq_expiration : Timestamp,
-        rq_host       : HostAndPort,
-        rq_callback   : Callback
+        rq_host       : HostAndPort
     }
 
     extern eternity() : Timestamp = "mongo::Date_t::max()"
     extern after(t : Timestamp, span : Timespan) : Timestamp = "{t} + {span}"
+    extern nullConn() : ConnInterface = "nullptr"
+    extern nullReq() : Callback = "nullptr"
 
     // options (immutable)
     state minConnections     : Int
@@ -59,37 +61,41 @@ ConnectionPoolCore:
     state reqs           : Set<Request>
     state retId          : Int
 
-    invariant unique [ c.val.conn_iface | c <- conns ];
-    invariant all [ c.val.conn_last_used < retId | c <- conns, c.val.conn_state == READY ];
+    invariant unique [ c.conn_iface | c <- conns ];
+    invariant all [ c.conn_last_used < retId | c <- conns, c.conn_state == READY ];
+    invariant unique [ r.rq_callback | r <- reqs ];
 
     // ------------------------------------------------------------ STATS
 
     query allHosts()
-        distinct [ c.val.conn_host | c <- conns ]
+        distinct [ c.conn_host | c <- conns ]
 
     query connsForHost(p : HostAndPort)
-        [ c | c <- conns, c.val.conn_host == p ]
+        [ c.conn_iface | c <- conns, c.conn_host == p ]
 
     private query enumerateReadyConns(p : HostAndPort)
-        [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == READY ]
+        [ c | c <- conns, c.conn_host == p and c.conn_state == READY ]
 
     query inUseConnections(p : HostAndPort)
-        len [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == CHECKED_OUT ]
+        len [ c | c <- conns, c.conn_host == p and c.conn_state == CHECKED_OUT ]
 
     query availableConnections(p : HostAndPort)
         len enumerateReadyConns(p)
 
     query refreshingConnections(p : HostAndPort)
-        len [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == PROCESSING ]
+        len [ c | c <- conns, c.conn_host == p and c.conn_state == PROCESSING ]
 
     query openConnections(p : HostAndPort)
         inUseConnections(p) + availableConnections(p) + refreshingConnections(p)
 
+    private query reqDataForHost(p : HostAndPort)
+        [ r | r <- reqs, r.rq_host == p ]
+
     query reqsForHost(p : HostAndPort)
-        [ r | r <- reqs, r.val.rq_host == p ]
+        [ r.rq_callback | r <- reqDataForHost(p) ]
 
     private query numReqs(p : HostAndPort)
-        len reqsForHost(p)
+        len reqDataForHost(p)
 
     // ------------------------------------------------------------ CORE
 
@@ -114,45 +120,63 @@ ConnectionPoolCore:
         (openConnections(p) < minConnections or
             availableConnections(p) + refreshingConnections(p) < numReqs(p))
 
-    query shouldKeepConnection(c : Connection, now : Timestamp)
-        // Do we want keep this ready connection around?
-        assume c.val.conn_state == READY;
-        // YES, if it has been used very recently (NOTE: I got this wrong at first)
-            (after(c.val.conn_returned, refreshRequirement) > now) or
-        // YES, if we need to keep minConnections constraint satisfied
-            (openConnections(c.val.conn_host) <= minConnections) or
-        // YES, if we have requests to serve
-            (availableConnections(c.val.conn_host) + refreshingConnections(c.val.conn_host) < numReqs(c.val.conn_host))
-        // and of course, NO otherwise.
+    private query hasReq(p : HostAndPort)
+        exists reqDataForHost(p)
 
     query nextReq(p : HostAndPort)
         // The next request to expire
-        argmin { req -> req.val.rq_expiration } reqsForHost(p)
-
-    private query hasReq(p : HostAndPort)
-        exists reqsForHost(p)
+        hasReq(p) ?
+            (argmin { req -> req.rq_expiration } reqDataForHost(p)).rq_callback :
+            nullReq()
 
     query mruConn(p : HostAndPort)
-        argmax { c -> c.val.conn_last_used } [ c |
-            c <- conns,
-            c.val.conn_host == p,
-            c.val.conn_state == READY ]
+        exists enumerateReadyConns(p) ?
+            (argmax { c -> c.conn_last_used } [ c | c <- enumerateReadyConns(p) ]).conn_iface :
+            nullConn()
 
     private query someConnIsCheckedOut(p : HostAndPort)
-        exists [ c | c <- conns, c.val.conn_host == p and c.val.conn_state == CHECKED_OUT ]
+        exists [ c | c <- conns, c.conn_host == p and c.conn_state == CHECKED_OUT ]
 
     private query isRunning(p : HostAndPort)
         hasReq(p) or someConnIsCheckedOut(p)
 
-    query handleForInterface(i : ConnInterface)
-        the [ c | c <- conns, c.val.conn_iface == i ]
+    private query hasInterface(i : ConnInterface)
+        exists [ c | c <- conns, c.conn_iface == i ]
+
+    private query handleForInterface(i : ConnInterface)
+        assume hasInterface(i);
+        the [ c | c <- conns, c.conn_iface == i ]
+
+    query shouldKeepConnection(i : ConnInterface, now : Timestamp)
+        // Do we want keep this ready connection around?
+        assume hasInterface(i);
+        assume handleForInterface(i).conn_state == READY;
+        // YES, if it has been used very recently (NOTE: I got this wrong at first)
+            (after(handleForInterface(i).conn_returned, refreshRequirement) > now) or
+        // YES, if we need to keep minConnections constraint satisfied
+            (openConnections(handleForInterface(i).conn_host) <= minConnections) or
+        // YES, if we have requests to serve
+            (availableConnections(handleForInterface(i).conn_host) + refreshingConnections(handleForInterface(i).conn_host) < numReqs(handleForInterface(i).conn_host))
+        // and of course, NO otherwise.
+
+    query connState(i : ConnInterface)
+        assume hasInterface(i);
+        handleForInterface(i).conn_state
+
+    query connHostAndPort(i : ConnInterface)
+        assume hasInterface(i);
+        handleForInterface(i).conn_host
+
+    query wasDropped(i : ConnInterface)
+        assume hasInterface(i);
+        handleForInterface(i).conn_dropped
 
     private query lastActivity(p : HostAndPort)
         // When was the last time a connection got returned?
         assume not isRunning(p);
-        max [ c.val.conn_returned |
-            c <- conns, c.val.conn_host == p and
-            c.val.conn_state != CHECKED_OUT ]
+        max [ c.conn_returned |
+            c <- conns, c.conn_host == p and
+            c.conn_state != CHECKED_OUT ]
 
     private query hostExpiration(p : HostAndPort)
         // When should we determine that we can close all the open connections
@@ -160,89 +184,130 @@ ConnectionPoolCore:
         isRunning(p) ? eternity() : after(lastActivity(p), hostTimeout)
 
     private query allKnownHosts()
-        [ c.val.conn_host | c <- conns ] + [ r.val.rq_host | r <- reqs ]
+        distinct ([ c.conn_host | c <- conns ] + [ r.rq_host | r <- reqs ])
 
     query hasEvent()
-        exists reqs or exists [ c | c <- conns, c.val.conn_state == READY ]
+        exists reqs or exists [ c | c <- conns, c.conn_state == READY ]
 
     query nextEvent()
         assume hasEvent();
-        min ([ r.val.rq_expiration     | r <- reqs ] +
-             [ c.val.conn_next_refresh | c <- conns, c.val.conn_state == READY ] +
-             [ hostExpiration(p)       | p <- allKnownHosts() ])
+        min ([ r.rq_expiration     | r <- reqs ] +
+             [ c.conn_next_refresh | c <- conns, c.conn_state == READY ] +
+             [ hostExpiration(p)   | p <- allKnownHosts() ])
 
     query nextRequestToExpire()
         assume exists reqs;
-        argmin { r -> r.val.rq_expiration } reqs
+        (argmin { r -> r.rq_expiration } reqs).rq_callback
 
     query hasExpiredRequest(now : Timestamp)
-        (exists reqs) and (nextRequestToExpire().val.rq_expiration <= now)
+        exists [r | r <- reqs, r.rq_expiration <= now]
 
     private query readyConns()
-        [ c | c <- conns, c.val.conn_state == READY ]
+        [ c | c <- conns, c.conn_state == READY ]
 
     query nextConnectionToRefresh()
         assume exists conns;
-        argmin { c -> c.val.conn_next_refresh } readyConns()
+        (argmin { c -> c.conn_next_refresh } readyConns()).conn_iface
 
     query hasConnectionToRefresh(now : Timestamp)
-        (exists readyConns()) and (nextConnectionToRefresh().val.conn_next_refresh <= now)
+        exists [c | c <- readyConns(), c.conn_next_refresh <= now]
 
     query nextHostToExpire()
         assume exists allKnownHosts();
         argmin { p -> hostExpiration(p) } allKnownHosts()
 
     query hasExpiredHost(now : Timestamp)
-        (exists allKnownHosts()) and (hostExpiration(nextHostToExpire()) <= now)
+        exists [ h | h <- allKnownHosts(), hostExpiration(h) <= now]
 
     // ------------------------------------------------------------ UPDATES
 
-    op addReq(r : Request)
-        assume not (r in reqs);
-        reqs.add(r);
+    op addReq(expiration : Timestamp, host : HostAndPort, callback : Callback)
+        assume not exists [ r | r <- reqs, r.rq_callback == callback ];
+        reqs.add({
+            rq_callback   : callback,
+            rq_expiration : expiration,
+            rq_host       : host});
 
-    op rmReq(r : Request)
-        assume r in reqs;
-        reqs.remove(r);
+    op rmReq(id : Callback)
+        assume   exists [ r | r <- reqs, r.rq_callback == id ];
+        reqs.remove(the [ r | r <- reqs, r.rq_callback == id ]);
 
-    op addConn(c : Connection)
-        assume not (c.val.conn_iface in [ cc.val.conn_iface | cc <- conns ]);
-        assume not (c in conns);
-        assume c.val.conn_state == PROCESSING;
-        conns.add(c);
+    op addConn(iface : ConnInterface, host : HostAndPort)
+        assume not hasInterface(iface);
+        conns.add({
+            conn_state        : PROCESSING,
+            conn_host         : host,
+            conn_iface        : iface,
+            conn_next_refresh : eternity(),
+            conn_returned     : eternity(),
+            conn_last_used    : 0,
+            conn_dropped      : false});
 
-    op rmConn(c : Connection)
-        assume c in conns;
+    op rmConn(iface : ConnInterface)
+        assume hasInterface(iface);
+        conns.remove(handleForInterface(iface));
+
+    op markDropped(i : ConnInterface)
+        assume hasInterface(i);
+        assume handleForInterface(i).conn_state == CHECKED_OUT;
+        assume not handleForInterface(i).conn_dropped;
+        let c = handleForInterface(i);
         conns.remove(c);
+        conns.add({
+            conn_state        : c.conn_state,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : c.conn_next_refresh,
+            conn_returned     : c.conn_returned,
+            conn_last_used    : c.conn_last_used,
+            conn_dropped      : true});
 
-    op markDropped(c : Connection)
-        assume c.val.conn_state == CHECKED_OUT;
-        assume c in conns;
-        c.val.conn_dropped = true;
+    op requestGranted(req : Callback, i : ConnInterface)
+        assume hasInterface(i);
+        assume handleForInterface(i).conn_state == READY;
+        assume exists [ r | r <- reqs, r.rq_callback == req ];
+        reqs.remove(the [ r | r <- reqs, r.rq_callback == req ]);
+        let c = handleForInterface(i);
+        conns.remove(c);
+        conns.add({
+            conn_state        : CHECKED_OUT,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : c.conn_next_refresh,
+            conn_returned     : c.conn_returned,
+            conn_last_used    : c.conn_last_used,
+            conn_dropped      : c.conn_dropped});
 
-    op requestGranted(r : Request, c : Connection)
-        assume r in reqs;
-        assume c in conns;
-        assume c.val.conn_state == READY;
-        reqs.remove(r);
-        c.val.conn_state = CHECKED_OUT;
-
-    op markProcessing(c : Connection)
-        assume c in conns;
-        assume c.val.conn_state == READY;
-        c.val.conn_state = PROCESSING;
+    op markProcessing(i : ConnInterface)
+        assume hasInterface(i);
+        assume handleForInterface(i).conn_state == READY;
+        let c = handleForInterface(i);
+        conns.remove(c);
+        conns.add({
+            conn_state        : PROCESSING,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : c.conn_next_refresh,
+            conn_returned     : c.conn_returned,
+            conn_last_used    : c.conn_last_used,
+            conn_dropped      : c.conn_dropped});
 
     op markReady(
-            c        : Connection,
+            i        : ConnInterface,
             now      : Timestamp,
             lastUsed : Timestamp,
             rt       : Timespan)
         assume rt == refreshRequirement; // Oops! Cozy bug requires this to be an arg.
-        assume c in conns;
-        assume c.val.conn_state != READY;
-        c.val.conn_state = READY;
-        // this is now the most-recently-used connection
-        c.val.conn_next_refresh = after(lastUsed, rt);
-        c.val.conn_returned = now;
-        c.val.conn_last_used = retId;
+        assume hasInterface(i);
+        assume handleForInterface(i).conn_state != READY;
+        let c = handleForInterface(i);
+        conns.remove(c);
+        conns.add({
+            conn_state        : READY,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : after(lastUsed, rt),
+            conn_returned     : now,
+            conn_last_used    : retId,
+            conn_dropped      : c.conn_dropped});
         retId = retId + 1;

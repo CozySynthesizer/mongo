@@ -147,7 +147,7 @@ private:
         const HostAndPort& hostAndPort);
 
     void processingComplete(
-        void* c, /* cannot forward-declare inner Connection class */
+        ConnectionInterface* c,
         Status status);
 
     void cleanupHost(
