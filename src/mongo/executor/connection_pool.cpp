@@ -137,7 +137,7 @@ void ConnectionPool::processingComplete(ConnectionInterface* connPtr, Status sta
     // pool
     if (status.isOK()) {
         auto now = _factory->now();
-        _core->markReady(connPtr, now, now, _core->getRefreshRequirement());
+        _core->markReady(connPtr, now, now);
         fulfillReqs(lk, hostAndPort);
         spawnConnections(lk, hostAndPort);
         waitForNextEvent(lk);
@@ -309,7 +309,7 @@ void ConnectionPool::returnConnection(ConnectionInterface* conn) {
         return;
     }
 
-    _core->markReady(conn, _factory->now(), conn->getLastUsed(), _core->getRefreshRequirement());
+    _core->markReady(conn, _factory->now(), conn->getLastUsed());
     fulfillReqs(lk, hostAndPort);
     waitForNextEvent(lk);
 }

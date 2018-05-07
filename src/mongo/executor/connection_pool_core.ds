@@ -99,8 +99,6 @@ ConnectionPoolCore:
 
     // ------------------------------------------------------------ CORE
 
-    query getRefreshRequirement()
-        refreshRequirement
     query getRefreshTimeout()
         refreshTimeout
 
@@ -221,6 +219,42 @@ ConnectionPoolCore:
 
     // ------------------------------------------------------------ UPDATES
 
+    private query markedReady(c : Connection, now : Timestamp, lastUsed : Timestamp)
+        {   conn_state        : READY,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : after(lastUsed, refreshRequirement),
+            conn_returned     : now,
+            conn_last_used    : retId,
+            conn_dropped      : c.conn_dropped}
+
+    private query markedProc(c : Connection)
+        {   conn_state        : PROCESSING,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : c.conn_next_refresh,
+            conn_returned     : c.conn_returned,
+            conn_last_used    : c.conn_last_used,
+            conn_dropped      : c.conn_dropped}
+
+    private query markedCo(c : Connection)
+        {   conn_state        : CHECKED_OUT,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : c.conn_next_refresh,
+            conn_returned     : c.conn_returned,
+            conn_last_used    : c.conn_last_used,
+            conn_dropped      : c.conn_dropped}
+
+    private query markedDropped(c : Connection)
+        {   conn_state        : c.conn_state,
+            conn_host         : c.conn_host,
+            conn_iface        : c.conn_iface,
+            conn_next_refresh : c.conn_next_refresh,
+            conn_returned     : c.conn_returned,
+            conn_last_used    : c.conn_last_used,
+            conn_dropped      : true}
+
     op addReq(expiration : Timestamp, host : HostAndPort, callback : Callback)
         assume not exists [ r | r <- reqs, r.rq_callback == callback ];
         reqs.add({
@@ -251,63 +285,25 @@ ConnectionPoolCore:
         assume hasInterface(i);
         assume handleForInterface(i).conn_state == CHECKED_OUT;
         assume not handleForInterface(i).conn_dropped;
-        let c = handleForInterface(i);
-        conns.remove(c);
-        conns.add({
-            conn_state        : c.conn_state,
-            conn_host         : c.conn_host,
-            conn_iface        : c.conn_iface,
-            conn_next_refresh : c.conn_next_refresh,
-            conn_returned     : c.conn_returned,
-            conn_last_used    : c.conn_last_used,
-            conn_dropped      : true});
+        conns = [ c.conn_iface == i ? markedDropped(c) : c | c <- conns ];
 
     op requestGranted(req : Callback, i : ConnInterface)
         assume hasInterface(i);
         assume handleForInterface(i).conn_state == READY;
         assume exists [ r | r <- reqs, r.rq_callback == req ];
         reqs.remove(the [ r | r <- reqs, r.rq_callback == req ]);
-        let c = handleForInterface(i);
-        conns.remove(c);
-        conns.add({
-            conn_state        : CHECKED_OUT,
-            conn_host         : c.conn_host,
-            conn_iface        : c.conn_iface,
-            conn_next_refresh : c.conn_next_refresh,
-            conn_returned     : c.conn_returned,
-            conn_last_used    : c.conn_last_used,
-            conn_dropped      : c.conn_dropped});
+        conns = [ c.conn_iface == i ? markedCo(c) : c | c <- conns ];
 
     op markProcessing(i : ConnInterface)
         assume hasInterface(i);
         assume handleForInterface(i).conn_state == READY;
-        let c = handleForInterface(i);
-        conns.remove(c);
-        conns.add({
-            conn_state        : PROCESSING,
-            conn_host         : c.conn_host,
-            conn_iface        : c.conn_iface,
-            conn_next_refresh : c.conn_next_refresh,
-            conn_returned     : c.conn_returned,
-            conn_last_used    : c.conn_last_used,
-            conn_dropped      : c.conn_dropped});
+        conns = [ c.conn_iface == i ? markedProc(c) : c | c <- conns ];
 
     op markReady(
             i        : ConnInterface,
             now      : Timestamp,
-            lastUsed : Timestamp,
-            rt       : Timespan)
-        assume rt == refreshRequirement; // Oops! Cozy bug requires this to be an arg.
+            lastUsed : Timestamp)
         assume hasInterface(i);
         assume handleForInterface(i).conn_state != READY;
-        let c = handleForInterface(i);
-        conns.remove(c);
-        conns.add({
-            conn_state        : READY,
-            conn_host         : c.conn_host,
-            conn_iface        : c.conn_iface,
-            conn_next_refresh : after(lastUsed, rt),
-            conn_returned     : now,
-            conn_last_used    : retId,
-            conn_dropped      : c.conn_dropped});
+        conns = [ c.conn_iface == i ? markedReady(c, now, lastUsed) : c | c <- conns ];
         retId = retId + 1;
