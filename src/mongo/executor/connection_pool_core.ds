@@ -181,9 +181,6 @@ ConnectionPoolCore:
         // to a given host/port?
         isRunning(p) ? eternity() : after(lastActivity(p), hostTimeout)
 
-    private query allKnownHosts()
-        distinct ([ c.conn_host | c <- conns ] + [ r.rq_host | r <- reqs ])
-
     query hasEvent()
         exists reqs or exists [ c | c <- conns, c.conn_state == READY ]
 
@@ -191,7 +188,7 @@ ConnectionPoolCore:
         assume hasEvent();
         min ([ r.rq_expiration     | r <- reqs ] +
              [ c.conn_next_refresh | c <- conns, c.conn_state == READY ] +
-             [ hostExpiration(p)   | p <- allKnownHosts() ])
+             [ hostExpiration(p)   | p <- allHosts() ])
 
     query nextRequestToExpire()
         assume exists reqs;
@@ -211,11 +208,11 @@ ConnectionPoolCore:
         exists [c | c <- readyConns(), c.conn_next_refresh <= now]
 
     query nextHostToExpire()
-        assume exists allKnownHosts();
-        argmin { p -> hostExpiration(p) } allKnownHosts()
+        assume exists allHosts();
+        argmin { p -> hostExpiration(p) } allHosts()
 
     query hasExpiredHost(now : Timestamp)
-        exists [ h | h <- allKnownHosts(), hostExpiration(h) <= now]
+        exists [ h | h <- allHosts(), hostExpiration(h) <= now]
 
     // ------------------------------------------------------------ UPDATES
 
