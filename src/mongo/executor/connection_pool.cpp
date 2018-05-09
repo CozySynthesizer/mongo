@@ -220,7 +220,7 @@ void ConnectionPool::waitForNextEvent(
 
         // check for expired hosts
         while (_core->hasExpiredHost(now)) {
-            cleanupHost(lk, _core->nextHostToExpire());
+            cleanupHost(lk, _core->nextHostToExpire(now));
         }
 
         // check for expired requests

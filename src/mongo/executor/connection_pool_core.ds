@@ -179,7 +179,11 @@ ConnectionPoolCore:
     private query hostExpiration(p : HostAndPort)
         // When should we determine that we can close all the open connections
         // to a given host/port?
-        isRunning(p) ? eternity() : after(lastActivity(p), hostTimeout)
+        assume not isRunning(p);
+        after(lastActivity(p), hostTimeout)
+
+    private query idleHosts()
+        [p | p <- allHosts(), not isRunning(p)]
 
     query hasEvent()
         exists reqs or exists [ c | c <- conns, c.conn_state == READY ]
@@ -188,7 +192,7 @@ ConnectionPoolCore:
         assume hasEvent();
         min ([ r.rq_expiration     | r <- reqs ] +
              [ c.conn_next_refresh | c <- conns, c.conn_state == READY ] +
-             [ hostExpiration(p)   | p <- allHosts() ])
+             [ hostExpiration(p)   | p <- idleHosts() ])
 
     query nextRequestToExpire()
         assume exists reqs;
@@ -207,12 +211,12 @@ ConnectionPoolCore:
     query hasConnectionToRefresh(now : Timestamp)
         exists [c | c <- readyConns(), c.conn_next_refresh <= now]
 
-    query nextHostToExpire()
-        assume exists allHosts();
-        argmin { p -> hostExpiration(p) } allHosts()
-
     query hasExpiredHost(now : Timestamp)
-        exists [ h | h <- allHosts(), hostExpiration(h) <= now]
+        exists [ h | h <- idleHosts(), hostExpiration(h) <= now]
+
+    query nextHostToExpire(now : Timestamp)
+        assume hasExpiredHost(now);
+        argmin { p -> hostExpiration(p) } idleHosts()
 
     // ------------------------------------------------------------ UPDATES
 
