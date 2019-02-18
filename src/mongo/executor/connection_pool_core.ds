@@ -205,7 +205,7 @@ ConnectionPoolCore:
         [ c | c <- conns, c.conn_state == READY ]
 
     query nextConnectionToRefresh()
-        assume exists conns;
+        assume exists readyConns();
         (argmin { c -> c.conn_next_refresh } readyConns()).conn_iface
 
     query hasConnectionToRefresh(now : Timestamp)
